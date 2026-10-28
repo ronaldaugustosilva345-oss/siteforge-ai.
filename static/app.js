@@ -1,3 +1,32 @@
+let csrf = "";
+async function authFetch(url, options={}) {
+  options.headers = {...(options.headers||{}), 'X-CSRF-Token':csrf};
+  return fetch(url, options);
+}
+async function authInit() {
+  const r = await fetch('/api/auth/me'); const data=await r.json();csrf=data.csrf_token;
+  const auth=document.getElementById('auth-panel');
+  auth.hidden=!!data.authenticated;
+  document.getElementById('signed-in').hidden=!data.authenticated;
+  document.getElementById('signed-in-email').textContent=data.email||'';
+  document.getElementById('generate').disabled=!data.authenticated;
+  refreshPlans();
+}
+async function authAction(mode) {
+  const note=document.getElementById('auth-notice');
+  const email=document.getElementById('auth-email').value;
+  const password=document.getElementById('auth-password').value;
+  const access=document.getElementById('access-code')?.value||'';
+  try {
+    const r=await authFetch('/api/auth/'+mode,{method:'POST',headers:{'Content-Type':'application/json','X-SiteForge-Access':access},body:JSON.stringify({email,password})});
+    const data=await r.json();if(!r.ok)throw Error(data.error||'Authentication failed');
+    csrf=data.csrf_token||csrf;note.textContent='Signed in successfully.';await authInit();
+  } catch(err) {note.textContent=err.message;}
+}
+document.getElementById('auth-login').onclick=()=>authAction('login');
+document.getElementById('auth-register').onclick=()=>authAction('register');
+document.getElementById('auth-logout').onclick=async()=>{await authFetch('/api/auth/logout',{method:'POST'});await authInit();};
+authInit().catch(()=>{document.getElementById('auth-notice').textContent='Authentication service unavailable.'});
 const $ = (id) => document.getElementById(id);
 let theme = 'modern';
 for (const button of document.querySelectorAll('.style')) {
@@ -40,7 +69,7 @@ $('generate').addEventListener('click', async () => {
   message.className = '';
   try {
     const access = $('access-code')?.value || '';
-    const response = await fetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json', 'X-SiteForge-Access':access}, body: JSON.stringify({description,theme}) });
+    const response = await authFetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json', 'X-SiteForge-Access':access}, body: JSON.stringify({description,theme}) });
     const ct = response.headers.get('content-type') || '';
     if (!ct.toLowerCase().includes('application/json')) throw new Error('The server returned an unexpected response. Please try again.');
     let result;
@@ -64,7 +93,7 @@ async function refreshPlans() {
   try {
     const r = await fetch('/api/plans');
     const info = await r.json();
-    $('quota-label').textContent = `${info.used} of ${info.plans.free.generations} generations used in the last 30 days (shared test quota).`;
+    $('quota-label').textContent = `${info.used} of 1 beta generations used in the last 30 days (per account).`;
   } catch { $('quota-label').textContent = 'Usage information unavailable.'; }
 }
 document.querySelectorAll('.disabled-paid').forEach(button => button.addEventListener('click', () => {

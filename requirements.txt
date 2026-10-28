@@ -1,3 +1,6 @@
 flask>=3.0,<4
 requests>=2.31,<3
 gunicorn>=22,<24
+Flask-SQLAlchemy>=3.1,<4
+Flask-Migrate>=4,<5
+psycopg[binary]>=3.2,<4

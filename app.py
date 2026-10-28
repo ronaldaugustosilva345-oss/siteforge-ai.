@@ -13,9 +13,15 @@ import re
 import uuid
 import zipfile
 from pathlib import Path
-from flask import Flask, jsonify, request, send_file, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory, session
 import requests
 from requests.exceptions import Timeout, RequestException
+from flask_sqlalchemy import SQLAlchemy
+from flask_migrate import Migrate
+from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import func
+from functools import wraps
+import secrets
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("siteforge")
@@ -25,6 +31,119 @@ OUTPUT = ROOT / "generated"
 OUTPUT.mkdir(exist_ok=True)
 app = Flask(__name__, static_folder="static")
 app.config["MAX_CONTENT_LENGTH"] = 24 * 1024
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "")
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///siteforge-beta.db").replace("postgres://", "postgresql://", 1)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("RENDER", "").lower() == "true"
+db = SQLAlchemy(app)
+migrate = Migrate(app, db)
+
+class User(db.Model):
+    __tablename__ = "users"
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(254), unique=True, nullable=False, index=True)
+    password_hash = db.Column(db.String(300), nullable=False)
+    plan = db.Column(db.String(20), nullable=False, default="free")
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=func.now())
+
+class UserGeneration(db.Model):
+    __tablename__ = "user_generations"
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False, index=True)
+    created_at = db.Column(db.DateTime(timezone=True), nullable=False, server_default=func.now())
+
+def current_user():
+    uid = session.get("user_id")
+    return db.session.get(User, uid) if isinstance(uid, int) else None
+
+def csrf_token():
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+@app.before_request
+def protect_requests():
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        if request.path == "/api/checkout/starter" or request.path == "/api/checkout/pro":
+            return None
+        if not hmac.compare_digest(request.headers.get("X-CSRF-Token", ""), session.get("csrf", "not-set")):
+            return jsonify(error="Your session expired. Refresh the page and try again."), 403
+
+@app.after_request
+def secure_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
+    return response
+
+@app.get("/api/auth/csrf")
+def auth_csrf():
+    return jsonify(csrf_token=csrf_token())
+
+@app.get("/api/auth/me")
+def auth_me():
+    u = current_user()
+    if not u:
+        return jsonify(authenticated=False, csrf_token=csrf_token())
+    return jsonify(authenticated=True, email=u.email, plan=u.plan, csrf_token=csrf_token())
+
+def valid_credentials(body):
+    email = str(body.get("email", "")).strip().lower()
+    password = body.get("password", "")
+    return email, password if isinstance(password, str) else ""
+
+@app.post("/api/auth/register")
+def auth_register():
+    body = request.get_json(silent=True) or {}
+    if not test_access_ok():
+        return jsonify(error="Private beta invitation required."), 403
+    email, password = valid_credentials(body)
+    if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not 12 <= len(password) <= 128:
+        return jsonify(error="Enter a valid email and password of at least 12 characters."), 400
+    if User.query.filter_by(email=email).first():
+        return jsonify(error="This email is already registered."), 409
+    user = User(email=email, password_hash=generate_password_hash(password, method="scrypt"))
+    db.session.add(user)
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return jsonify(error="Could not create account. Try again."), 409
+    session.clear()
+    session["user_id"] = user.id
+    return jsonify(ok=True, email=user.email, csrf_token=csrf_token()), 201
+
+@app.post("/api/auth/login")
+def auth_login():
+    body = request.get_json(silent=True) or {}
+    email, password = valid_credentials(body)
+    user = User.query.filter_by(email=email).first() if email else None
+    if not user or not check_password_hash(user.password_hash, password):
+        return jsonify(error="Incorrect email or password."), 401
+    session.clear()
+    session["user_id"] = user.id
+    return jsonify(ok=True, email=user.email, csrf_token=csrf_token())
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    session.clear()
+    return jsonify(ok=True)
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not current_user():
+            return jsonify(error="Sign in to create or download websites."), 401
+        return fn(*args, **kwargs)
+    return wrapped
+
+def user_usage(uid):
+    since = datetime.now(timezone.utc) - timedelta(days=30)
+    return UserGeneration.query.filter(UserGeneration.user_id == uid, UserGeneration.created_at >= since).count()
+
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MODEL = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 DB = ROOT / "siteforge.db"
@@ -44,6 +163,7 @@ def test_access_ok():
     return hmac.compare_digest(request.headers.get("X-SiteForge-Access", ""), ACCESS_CODE)
 
 quota_lock = threading.Lock()
+project_owners = {}
 PLANS = {"free": {"name": "Free", "price_usd": 0, "generations": 1},
          "starter": {"name": "Starter", "price_usd": 15, "generations": 20},
          "pro": {"name": "Pro", "price_usd": 30, "generations": None}}
@@ -61,7 +181,8 @@ def usage():
 
 @app.get("/api/plans")
 def plans():
-    return jsonify(plans=PLANS, active_plan="free", used=usage(),
+    u = current_user()
+    return jsonify(plans=PLANS, active_plan=u.plan if u else "free", used=user_usage(u.id) if u else 0,
                    period="rolling 30 days", checkout_enabled=False,
                    notice="Paid plans are previews only. No payment integration is configured.")
 
@@ -255,6 +376,7 @@ def hosted_generation(messages):
 
 
 @app.post("/api/generate")
+@login_required
 def generate():
     payload = request.get_json(silent=True) or {}
     description = str(payload.get("description", "")).strip()
@@ -267,9 +389,10 @@ def generate():
         return jsonify(error="Private testing access required. Configure SITEFORGE_TEST_PASSWORD in Render."), 403
     if IS_RENDER and not (REMOTE_KEY and REMOTE_MODEL):
         return jsonify(error="Hosted AI is not configured in Render yet."), 503
-    with quota_lock:
-        if usage() >= PLANS["free"]["generations"]:
-            return jsonify(error="Free plan limit reached (1 successful website per 30 days). Paid plans are not yet available."), 403
+    user = current_user()
+    # Private beta: no paid entitlements until payment validation exists.
+    if user_usage(user.id) >= 1:
+        return jsonify(error="Your Free beta quota is used (1 website per rolling 30 days)."), 403
     instructions = (
         "You create polished, functional, single-page static websites. "
         "Respond ONLY with a JSON object whose EXACT keys are 'index.html', 'style.css', 'script.js'. "
@@ -300,11 +423,11 @@ def generate():
         project_id = uuid.uuid4().hex[:12]
         directory = OUTPUT / project_id
         directory.mkdir()
+        project_owners[project_id] = user.id
         for filename, content in files.items():
             (directory / filename).write_text(content, encoding="utf-8")
-        with quota_lock:
-            with db_connect() as con:
-                con.execute("INSERT INTO generations(created_at) VALUES (?)", (datetime.now(timezone.utc).isoformat(),))
+        db.session.add(UserGeneration(user_id=user.id))
+        db.session.commit()
         return jsonify(id=project_id, html=files["index.html"], css=files["style.css"], js=files["script.js"])
     except GenerationError as exc:
         return jsonify(error=str(exc)), exc.status
@@ -316,11 +439,14 @@ def generate():
         return jsonify(error="The generation service encountered an error. Please try again."), 500
 
 @app.get("/api/download/<project_id>")
+@login_required
 def download(project_id):
     if not test_access_ok():
         return jsonify(error="Private test access required."), 403
     if not re.fullmatch(r"[a-f0-9]{12}", project_id):
         return jsonify(error="Invalid project ID."), 400
+    if project_owners.get(project_id) != current_user().id:
+        return jsonify(error="Project not found."), 404
     directory = OUTPUT / project_id
     if not directory.is_dir():
         return jsonify(error="Project not found."), 404
