@@ -32,6 +32,7 @@ REMOTE_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 REMOTE_MODEL = os.getenv("OPENROUTER_MODEL", "").strip()
 FALLBACK_MODEL = os.getenv("OPENROUTER_FALLBACK_MODEL", "").strip()
 REMOTE_TIMEOUT = min(95, max(10, int(os.getenv("OPENROUTER_TIMEOUT", "80"))))
+REMOTE_MAX_TOKENS = min(16000, max(1000, int(os.getenv("OPENROUTER_MAX_TOKENS", "10000"))))
 ACCESS_CODE = os.getenv("SITEFORGE_TEST_PASSWORD", "").strip()
 IS_RENDER = os.getenv("RENDER", "").lower() == "true"
 
@@ -208,7 +209,9 @@ def parse_remote_reply(response):
     choice = choices[0]
     reason = choice.get("finish_reason")
     if reason == "length":
-        raise GenerationError("The AI response was cut off. Try a shorter website brief.")
+        logger.warning("OpenRouter truncated output finish_reason=length completion_tokens=%s",
+                       (body.get("usage") or {}).get("completion_tokens"))
+        raise GenerationError("The AI stopped before finishing the website. Try another model or a smaller design.", retryable=True)
     if reason in {"content_filter", "error"}:
         raise GenerationError("The AI provider could not finish the request.")
     message = choice.get("message") or {}
@@ -233,7 +236,7 @@ def hosted_generation(messages):
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {REMOTE_KEY}", "Content-Type": "application/json"},
                 json={"model": model, "stream": False, "temperature": 0.5,
-                      "max_tokens": 6500, "messages": messages},
+                      "max_tokens": REMOTE_MAX_TOKENS, "messages": messages},
                 timeout=(8, REMOTE_TIMEOUT),
             )
             return parse_remote_reply(response)
