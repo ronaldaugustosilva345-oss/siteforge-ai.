@@ -12,10 +12,10 @@ async function checkStatus() {
     const result = await (await fetch('/api/status')).json();
     const element = $('connection');
     if (result.online && result.available) {
-      element.textContent = '● Ollama connected · ' + result.model;
+      element.textContent = '● AI configured · ' + result.model;
       element.className = 'status ready';
     } else {
-      element.textContent = '● ' + (result.online ? 'Model not installed: ' + result.model : 'Ollama offline');
+      element.textContent = '● ' + (result.online ? 'Model not installed: ' + result.model : 'AI not configured');
       element.className = 'status offline';
     }
   } catch { $('connection').textContent = '● Backend offline'; $('connection').className = 'status offline'; }
@@ -36,10 +36,11 @@ $('generate').addEventListener('click', async () => {
   if (description.length < 12) { message.textContent = 'Please write a more detailed description.'; message.className = 'error'; return; }
   $('generate').disabled = true;
   $('generate').firstElementChild.textContent = '✦ Creating your website...';
-  message.textContent = 'Generating with your local AI. This may take a few minutes.';
+  message.textContent = 'Generating your website...';
   message.className = '';
   try {
-    const response = await fetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({description,theme}) });
+    const access = $('access-code')?.value || '';
+    const response = await fetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json', 'X-SiteForge-Access':access}, body: JSON.stringify({description,theme}) });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || 'An unexpected error occurred.');
     $('empty').style.display = 'none';
@@ -48,7 +49,7 @@ $('generate').addEventListener('click', async () => {
     frame.srcdoc = previewDocument(result.html, result.css, result.js);
     $('preview-state').textContent = 'Your website is ready';
     $('download').classList.remove('disabled');
-    $('download').href = '/api/download/' + result.id;
+    $('download').dataset.projectId = result.id;
     message.textContent = 'Success! Preview your website and download the ZIP.';
     message.className = 'good';
     refreshPlans();
@@ -68,3 +69,17 @@ document.querySelectorAll('.disabled-paid').forEach(button => button.addEventLis
 }));
 refreshPlans();
 checkStatus();
+
+$('download').addEventListener('click', async (e) => {
+  e.preventDefault();
+  if (!$('download').dataset.projectId) return;
+  try {
+    const response = await fetch('/api/download/' + $('download').dataset.projectId,
+      {headers:{'X-SiteForge-Access':$('access-code')?.value || ''}});
+    if (!response.ok) throw new Error('Download failed; check private test code.');
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a'); link.href=url;link.download='siteforge-website.zip';link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  } catch (err) {$('message').textContent=err.message;$('message').className='error';}
+});
