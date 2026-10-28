@@ -41,7 +41,11 @@ $('generate').addEventListener('click', async () => {
   try {
     const access = $('access-code')?.value || '';
     const response = await fetch('/api/generate', { method:'POST', headers:{'Content-Type':'application/json', 'X-SiteForge-Access':access}, body: JSON.stringify({description,theme}) });
-    const result = await response.json();
+    const ct = response.headers.get('content-type') || '';
+    if (!ct.toLowerCase().includes('application/json')) throw new Error('The server returned an unexpected response. Please try again.');
+    let result;
+    try { result = await response.json(); }
+    catch { throw new Error('The server returned invalid data. Please try again.'); }
     if (!response.ok) throw new Error(result.error || 'An unexpected error occurred.');
     $('empty').style.display = 'none';
     const frame = $('frame');
@@ -60,7 +64,7 @@ async function refreshPlans() {
   try {
     const r = await fetch('/api/plans');
     const info = await r.json();
-    $('quota-label').textContent = `${info.used} of ${info.plans.free.generations} generations used in the last 30 days (on this computer).`;
+    $('quota-label').textContent = `${info.used} of ${info.plans.free.generations} generations used in the last 30 days (shared test quota).`;
   } catch { $('quota-label').textContent = 'Usage information unavailable.'; }
 }
 document.querySelectorAll('.disabled-paid').forEach(button => button.addEventListener('click', () => {
